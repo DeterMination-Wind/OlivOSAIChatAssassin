@@ -1,0 +1,28 @@
+{
+    "name": "群聊刺客",
+    "author": "lunzhiPenxil",
+    "namespace": "OlivOSAIChatAssassin",
+    "info": "基于OpenAI兼容API的群聊AI助手，会收集聊天记录并择机加入群聊",
+    "priority": 30000,
+    "svn": 1,
+    "version": "1.0.0",
+    "compatible_svn": 190,
+    "message_mode": "olivos_string",
+    "support": [
+        {
+            "sdk": "all",
+            "platform": "all",
+            "model": "all"
+        }
+    ],
+    "menu_config": [
+        {
+            "title": "查看配置",
+            "event": "OlivOSAIChatAssassin_Menu_Config"
+        },
+        {
+            "title": "查看状态",
+            "event": "OlivOSAIChatAssassin_Menu_Status"
+        }
+    ]
+}

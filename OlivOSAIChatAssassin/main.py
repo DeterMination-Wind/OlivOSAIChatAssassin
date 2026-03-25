@@ -20,6 +20,8 @@ gConfigPath = './plugin/data/OlivOSAIChatAssassin/config.json'
 gSkipStr = '【SKIP】'
 
 gGroupLock: 'dict[str, threading.Lock]' = {}
+gGroupKnowledgeCounter: 'dict[str, int]' = {}
+gGroupKnowledgeCounterLimit: int = int(4 * 4)
 
 gMemoryDir = './plugin/data/OlivOSAIChatAssassin'
 gMemoryPath = './plugin/data/OlivOSAIChatAssassin/memory.json'
@@ -27,6 +29,7 @@ gMemory = {
     '全局': {
         '常识': [],
         '知识搜索': {},
+        '知识缓存': {},
         '人物关系': {}
     }
 }
@@ -40,10 +43,11 @@ configDefault = {
     'max_tokens': 512,
     'temperature': 0.7,
     'personality': '你是一个伪装成人类的自豪的新锐AI，你择机加入聊天，避免过多尬聊。别让他们发现你的真实身份！！！',
+    'record_knowledge': True,
     'enabled_groups': [
         'all'
     ],
-    'history_size': 10,
+    'history_size': 12,
     'reply_probability': 1,
     'reply_keywords': [],
     'mention_reply': True,
@@ -122,7 +126,7 @@ def load_config():
             with open(gConfigPath, 'w', encoding='utf-8') as f:
                 json.dump(gConfig, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        log(f'加载配置失败: {e}')
+        warn(f'加载配置失败: {e}')
         gConfig = None
 
 
@@ -137,7 +141,7 @@ def load_memory():
             gMemory = {}
             write_memory()
     except Exception as e:
-        log(f'加载记忆失败: {e}')
+        warn(f'加载记忆失败: {e}')
         gMemory = None
 
 
@@ -148,7 +152,7 @@ def write_memory():
         with open(gMemoryPath, 'w', encoding='utf-8') as f:
             json.dump(gMemory, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        log(f'写入记忆失败: {e}')
+        warn(f'写入记忆失败: {e}')
     gMemoryLock.release()
 
 
@@ -206,12 +210,15 @@ def add_message_to_history(group_id, message, user_id, nickname):
     if group_id not in gMessageHistory:
         return
     timestamp = time.time()
+    message_new = message
+    if len(message_new) > 100:
+        message_new = message_new[:100] + '...'
     msg_entry = {
         'timestamp': timestamp,
         'time': datetime.now().astimezone().replace(microsecond=0).isoformat(),
         'user_id': user_id,
         'nickname': nickname,
-        'message': message
+        'message': message_new
     }
     gMessageHistory[group_id].append(msg_entry)
 
@@ -249,6 +256,7 @@ def reply_to_group(plugin_event, group_id):
     self_id = plugin_event.base_info['self_id']
     mention_str = f'[OP:at,id={self_id}]'
     personality = gConfig.get('personality', '')
+    record_knowledge = gConfig.get('record_knowledge', True)
     contentDefault = f'''
 # 规则
 - 你是一个人类，这是你日常水群的群聊，你会根据你的人格设定自行决定要不要参与群聊对话
@@ -277,7 +285,7 @@ def reply_to_group(plugin_event, group_id):
 - 杜绝流水账，请每次都决定自己需要长期记住什么东西
 - 仅输出需要记忆的信息
 - 不要遗忘别的群的记忆
-- 最终长度限制在100字以内
+- 最终长度限制在128字以内
 '''
         # 格式化历史为OpenAI消息格式
         messages = get_ai_context(gConfig, history, content, flagMerge=True)
@@ -287,56 +295,116 @@ def reply_to_group(plugin_event, group_id):
             write_memory()
             log(f'[本群记忆]\n{gMemory[group_id]}')
         except Exception as e:
-            log(f'API FATAL: {e}')
+            warn(f'API FATAL: {e}')
+
+    # 生成长期记忆
+    def set_knowledge(t_thisMemory: dict):
+        history = list(gMessageHistory.get(group_id, deque()))
+        # 设置任务
+        examples_knowledge = {
+            "中国": "五千年文明古国，幅员辽阔，正全面推进民族复兴，坚持和平发展。"
+        }
+        content = f'''
+# 当前任务
+- 分析当前聊天记录，提炼需要记住的知识点，注意不是对于现状的记录，只记录常识性的知识
+- 每条知识点长度限制在32字以内
+- 每条知识带有一个介于2至8字之间的关键词，被用于作为子字符串进行搜索
+- 知识点以Json对象的格式输出，知识点的关键词为键，内容为值
+
+# 参考输出
+{json.dumps(examples_knowledge, ensure_ascii=False)}
+'''
+        # 格式化历史为OpenAI消息格式
+        messages = get_ai_context(
+            gConfig, history, content, flagMerge=True,
+            prefix=f'前情提要：{gMemory.get(group_id, gMemoryDefaultStr)}\n\n现在提炼如下对话中的重要知识点：'
+        )
+        # 调用 API
+        try:
+            knowledge_data_str = call_ai(gConfig, messages, temperature_override=0.7, json_mode=False)
+            knowledge_data = None
+            try:
+                knowledge_data = json.loads(knowledge_data_str)
+            except Exception as e:
+                warn(f'API JSON DATA FATAL: {e}\n{knowledge_data_str}')
+                knowledge_data = None
+            if type(knowledge_data) is not dict:
+                warn(f'API DATA TYPE FATAL: \n{knowledge_data_str}')
+            else:
+                if '全局' not in gMemory:
+                    gMemory['全局'] = {}
+                if '知识缓存' not in gMemory['全局']:
+                    gMemory['全局']['知识缓存'] = {}
+                for k, v in knowledge_data.items():
+                    if (
+                        type(k) is str
+                        and type(v) is str
+                    ):
+                        gMemory['全局']['知识缓存'][k] = v
+                        log(f'[更新知识] - {k}\n{v}')
+                write_memory()
+        except Exception as e:
+            warn(f'API FATAL: {e}')
 
     # 设置任务
     thisMemoryG = {}
     for k, v in gMemory.get('全局', {}).items():
         if k not in (
             '人物关系',
+            '知识缓存',
             '知识搜索',
         ):
             thisMemoryG[k] = v
-    thisMemoryG['知识搜索'] = {}
-    thisMemoryM = gMemory.get('全局', {'知识搜索': {}}).get('知识搜索', {})
-    if type(thisMemoryM) is dict:
-        for k, v in thisMemoryM.items():
-            flagHit = False
-            for j in history:
-                if k in j.get('message', ''):
-                    flagHit = True
-            if flagHit:
-                log(f'PEAK UP - [知识搜索] {k}')
-                thisMemoryG['知识搜索'][k] = v
-    thisMemoryG['人物关系'] = {}
-    thisMemoryP = gMemory.get('全局', {'人物关系': {}}).get('人物关系', {})
-    if type(thisMemoryP) is dict:
-        for k, v in thisMemoryP.items():
-            flagHit = False
-            flagHit_str = None
-            for j in history:
-                if k == j.get('user_id', None):
-                    flagHit = True
-                    flagHit_str = k
-                    break
-                if (
-                    type(v) is list
-                    and len(v) >= 1
-                ):
-                    if type(v[0]) is str:
-                        if v[0] in j.get('message', '').lower():
-                            flagHit = True
-                            flagHit_str = v[0]
-                            break
-                    elif type(v[0]) is list:
-                        for n in v[0]:
-                            if n in j.get('message', '').lower():
+    key_gMemory_const = '知识搜索'
+    thisMemoryG[key_gMemory_const] = {}
+    for key_gMemory in (
+        '知识缓存',
+        '知识搜索',
+    ):
+        thisMemoryM = gMemory.get('全局', {key_gMemory: {}}).get(key_gMemory, {})
+        if type(thisMemoryM) is dict:
+            for k, v in thisMemoryM.items():
+                flagHit = False
+                for j in history:
+                    if k in j.get('message', ''):
+                        flagHit = True
+                if flagHit:
+                    log(f'PEAK UP - [{key_gMemory}] {k}')
+                    thisMemoryG[key_gMemory_const][k] = v
+
+    key_gMemory_const = '人物关系'
+    thisMemoryG[key_gMemory_const] = {}
+    for key_gMemory in (
+        '人物关系',
+    ):
+        thisMemoryP = gMemory.get('全局', {key_gMemory: {}}).get(key_gMemory, {})
+        if type(thisMemoryP) is dict:
+            for k, v in thisMemoryP.items():
+                flagHit = False
+                flagHit_str = None
+                for j in history:
+                    if k == j.get('user_id', None):
+                        flagHit = True
+                        flagHit_str = k
+                        break
+                    if (
+                        type(v) is list
+                        and len(v) >= 1
+                    ):
+                        if type(v[0]) is str:
+                            if v[0] in j.get('message', '').lower():
                                 flagHit = True
-                                flagHit_str = n
+                                flagHit_str = v[0]
                                 break
-            if flagHit:
-                log(f'PEAK UP - [人物关系] {flagHit_str}')
-                thisMemoryG['人物关系'][k] = v
+                        elif type(v[0]) is list:
+                            for n in v[0]:
+                                if n in j.get('message', '').lower():
+                                    flagHit = True
+                                    flagHit_str = n
+                                    break
+                if flagHit:
+                    log(f'PEAK UP - [{key_gMemory}] {flagHit_str}')
+                    thisMemoryG[key_gMemory_const][k] = v
     thisMemory = {
         '全局': thisMemoryG,
         group_id: gMemory.get(group_id, gMemoryDefaultStr)
@@ -357,14 +425,23 @@ def reply_to_group(plugin_event, group_id):
     try:
         reply_text = call_ai(gConfig, messages)
     except Exception as e:
-        log(f'API FATAL: {e}')
+        warn(f'API FATAL: {e}')
     # 发送回复
-    if reply_text is not None:
+    if reply_text is None:
+        get_gGroupKnowledgeCounter(str(group_id), False)
+        log('NONE')
+    else:
         # 限制消息长度
         max_len = gConfig.get('max_message_length', 2000)
         if len(reply_text) > max_len:
             reply_text = reply_text[:max_len] + '...'
-        if reply_text != gSkipStr:
+        if reply_text == gSkipStr:
+            get_gGroupKnowledgeCounter(str(group_id), False)
+            log('SKIP')
+        else:
+            flag_needKnowledge = get_gGroupKnowledgeCounter(str(group_id), True)
+            if record_knowledge is not True:
+                flag_needKnowledge = False
             reply_list = reply_split(reply_wash(reply_text))
             log(f'REPLY - {reply_list}')
             for i in reply_list:
@@ -372,13 +449,17 @@ def reply_to_group(plugin_event, group_id):
                     add_message_to_history(group_id, i, None, None)
             t_set_memory = threading.Thread(target=set_memory)
             t_set_memory.start()
+            if flag_needKnowledge:
+                t_set_knowledge = threading.Thread(
+                    target=set_knowledge,
+                    args=(thisMemory, )
+                )
+                t_set_knowledge.start()
             sleep(1 + (random.random() * 2 - 1) * 0.95)
             reply(plugin_event, reply_list)
             t_set_memory.join()
-        else:
-            log('SKIP')
-    else:
-        log('NONE')
+            if flag_needKnowledge:
+                t_set_knowledge.join()
 
 
 def get_ai_context(
@@ -466,7 +547,7 @@ def call_ai(
         res = get_message(res, json_mode=json_mode)
         log_usage(get_usage(result.get('usage', {})))
     else:
-        log(f'API ERR: {response.status_code} {response.text}')
+        warn(f'API ERR: {response.status_code} {response.text}')
     return res
 
 
@@ -503,9 +584,9 @@ def get_json_message(data_str: str):
                     res_list.append(data_dict['message'])
                     log('DATA TYPE - JSON')
                 else:
-                    log(f'DATA ERR: {i}')
+                    warn(f'DATA ERR: {i}')
             except Exception:
-                log(f'DATA ERR: {i}')
+                warn(f'DATA ERR: {i}')
         else:
             res_list.append(i)
             log('DATA TYPE - STR')
@@ -587,11 +668,19 @@ def send_message_force(botHash, send_type, target_id, message):
         plugin_event.send(send_type, target_id, message)
 
 
-def log(msg: str):
+def logRaw(level: int, msg: str):
     if gProc is not None:
-        gProc.log(2, msg, [
+        gProc.log(level, msg, [
             (gPluginName, 'default')
         ])
+
+
+def log(msg: str):
+    logRaw(2, msg)
+
+
+def warn(msg: str):
+    logRaw(3, msg)
 
 
 def reply(plugin_event, msg: list):
@@ -599,9 +688,11 @@ def reply(plugin_event, msg: list):
         len_i = len(i)
         if len_i > 0:
             sleep_time = sum([
-                0.3 + (random.random() * 2 - 1) * 0.25
+                0.2 + (random.random() * 2 - 1) * 0.15
                 for _ in range(len_i)
             ])
+            if sleep_time > 30:
+                sleep_time /= 2
             sleep(sleep_time)
             plugin_event.reply(i)
 
@@ -631,3 +722,24 @@ def msg_wash(msg: str):
 def sleep(sleep_time: float):
     log(f"WAIT - {sleep_time:.2f} s")
     time.sleep(sleep_time)
+
+
+def get_gGroupKnowledgeCounter(group_id: str, flag_busy: bool, rate: int = 4):
+    res = False
+    if group_id not in gGroupKnowledgeCounter:
+        gGroupKnowledgeCounter[group_id] = gGroupKnowledgeCounterLimit
+    if flag_busy:
+        gGroupKnowledgeCounter[group_id] += int(rate)
+    else:
+        gGroupKnowledgeCounter[group_id] += 1
+    if (
+        flag_busy
+        and gGroupKnowledgeCounter[group_id] >= gGroupKnowledgeCounterLimit
+    ):
+        gGroupKnowledgeCounter[group_id] = 0
+        res = True
+    if not res:
+        log(f'KNOWLEDGE [{group_id}] - {gGroupKnowledgeCounter[group_id]} / {gGroupKnowledgeCounterLimit}')
+    else:
+        log(f'KNOWLEDGE [{group_id}] - HIT')
+    return res

@@ -1,65 +1,92 @@
-# NapCatAIChatAssassin
+# NapCat AI Chat Assassin
 
-这是基于原仓库 `lunzhiPenxil/OlivOSAIChatAssassin` 的 `NapCat` fork，继续遵守原项目的 `AGPL-3.0` 许可证。
+基于 NapCat 的智能群聊对话机器人，具有拟人化的回复能力和长期记忆功能。
 
-当前版本已改成 `NapCat` 版，不再依赖 `OlivOS`。
+## 概述
 
-当前实现思路：
+这是一个基于 [lunzhiPenxil/OlivOSAIChatAssassin](https://github.com/lunzhiPenxil/OlivOSAIChatAssassin) 的 NapCat 分支版本。项目已从 OlivOS 插件形态迁移为 NapCat HTTP + SSE 常驻服务，提供更稳定可靠的群聊AI对话体验。
 
-- 保留原项目的“群里拟人插话”目标
-- 人设改成 `Cain（该隐）` 的管理局世界观设定
-- 主动插话判定仍保留原仓库逻辑：`@`、关键词、随机概率先决定是否进入回复流程，最终是否开口仍由人格 prompt 决定
-- 模型调用层补上 CainBot 第 6 点里的关键能力：`chat/completions` / `responses` 双通道兼容、自动回退、重试、冷却
+## 特性
 
-## Fork 说明
+- 🎭 **角色扮演**: 采用 Cain（该隐）的管理局世界观设定，具有独特的人格
+- 🤖 **智能回复**: 支持 @ 提及、关键词触发和随机概率触发多种回复方式
+- 🔄 **模型容错**: 多模型自动回退机制，确保服务稳定性
+- 💾 **长期记忆**: 自动维护群聊上下文记忆，提供连贯的对话体验
+- ⚡ **高性能**: 基于 NapCat 的 HTTP + SSE 架构，响应迅速
 
-- 上游仓库：`https://github.com/lunzhiPenxil/OlivOSAIChatAssassin`
-- 当前仓库定位：把原本的 `OlivOS` 插件形态迁移为 `NapCat HTTP + SSE` 常驻服务
-- 许可证：沿用上游 `AGPL-3.0`
+## 快速开始
 
-## 运行
+### 安装依赖
 
 ```bash
 pip install -e .
+```
+
+### 启动服务
+
+```bash
 python -m OlivOSAIChatAssassin
 ```
 
-首次运行会在仓库根目录创建：
+首次运行会在项目根目录创建配置文件和记忆文件：
+- `data/config.json` - 配置文件
+- `data/memory.json` - 记忆数据
 
-- `data/config.json`
-- `data/memory.json`
+## 配置说明
 
-## 配置
+编辑 `data/config.json` 进行配置：
 
-`data/config.json` 默认包含三部分：
+### NapCat 配置
+```json
+{
+  "napcat": {
+    "base_url": "NapCat HTTP API 地址",
+    "event_base_url": "NapCat SSE 地址",
+    "event_path": "/_events"
+  }
+}
+```
 
-- `napcat`: NapCat HTTP API 和 SSE 事件流配置
-- `ai`: OpenAI 兼容接口配置
-- `bot`: 群启用范围、人格 prompt、主动回复筛选 prompt 等
+### AI 模型配置
+```json
+{
+  "ai": {
+    "api_base": "OpenAI 兼容接口地址（建议包含 /v1）",
+    "model": "gpt-5.4-mini",
+    "failover_models": ["gpt-5.4", "gpt-5.2", "deepseek-ai/deepseek-v3.2"],
+    "reply_model": "主回复模型（可选）",
+    "memory_model": "记忆总结模型（可选）"
+  }
+}
+```
 
-关键字段：
+### 机器人配置
+```json
+{
+  "bot": {
+    "enabled_groups": ["群号列表"],
+    "persona_prompt": "Cain 角色设定 prompt",
+    "reply_probability": 0.3
+  }
+}
+```
 
-- `napcat.base_url`: NapCat HTTP API 地址
-- `napcat.event_base_url`: NapCat SSE 地址
-- `napcat.event_path`: 一般填 `/_events`
-- `ai.api_base`: OpenAI 兼容接口根地址，建议带 `/v1`
-- `ai.model`: 主模型，默认是 `gpt-5.4-mini`
-- `ai.failover_models`: 故障转移模型列表，默认是 `["gpt-5.4","gpt-5.2","deepseek-ai/deepseek-v3.2","deepseek-ai/deepseek-v3.1-terminus","gpt-5-codex-mini"]`
-- `ai.reply_model`: 主回复模型，可留空继承 `model`
-- `ai.memory_model`: 群长期记忆总结模型，可留空继承 `model`
-- `bot.enabled_groups`: 生效群号列表，填 `["all"]` 表示所有群
-- `bot.persona_prompt`: Cain 的人格与世界观 prompt
-- `bot.reply_probability`: 非 `@` 且未命中关键词时，进入回复流程的随机概率
+## 工作原理
 
-## 行为
+1. **触发机制**:
+   - 被 @ 提及时优先回复
+   - 命中预设关键词时触发回复
+   - 随机概率触发（由 `reply_probability` 控制）
 
-- 被 `@` 或命中 `reply_keywords` 时优先回复
-- 否则按 `reply_probability` 决定是否进入回复流程
-- 决定回复后，再用 Cain 人设 prompt 生成最终回复
-- 如果模型输出 `【SKIP】`，则本轮不发言
-- 每次成功回复后会异步更新本群长期记忆
+2. **回复生成**:
+   - 使用 Cain 角色设定 prompt 生成拟人化回复
+   - 模型可输出 `【SKIP】` 跳过本次回复
+   - 支持多模型自动回退确保可用性
 
-## 说明
+3. **记忆管理**:
+   - 每次成功回复后异步更新群聊长期记忆
+   - 记忆用于维持对话连贯性
 
-- `app.json` 仍在仓库里，但现在只是历史文件，不参与运行
-- 当前版本重点是把宿主从 `OlivOS` 改到 `NapCat`，并把模型链路升级到更稳的 OpenAI 兼容层
+## 许可证
+
+本项目基于 [AGPL-3.0](LICENSE) 许可证开源。

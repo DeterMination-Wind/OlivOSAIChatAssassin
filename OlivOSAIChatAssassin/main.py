@@ -322,26 +322,44 @@ def reply_to_group(plugin_event, group_id):
         # 调用 API
         try:
             knowledge_data_str = call_ai(gConfig, messages, temperature_override=0.7, json_mode=False)
-            knowledge_data = None
+            knowledge_data_str = knowledge_data_str.lstrip("```json")
+            knowledge_data_str = knowledge_data_str.lstrip("```")
+            knowledge_data_str = knowledge_data_str.rstrip("```")
+            knowledge_data_str = knowledge_data_str.replace("\r", "")
+            knowledge_data = {}
+            flag_knowledge_err = False
+            flag_knowledge_update = False
             try:
                 knowledge_data = json.loads(knowledge_data_str)
             except Exception as e:
                 warn(f'API JSON DATA FATAL: {e}\n{knowledge_data_str}')
-                knowledge_data = None
+                knowledge_data = {}
+                flag_knowledge_err = True
             if type(knowledge_data) is not dict:
                 warn(f'API DATA TYPE FATAL: \n{knowledge_data_str}')
-            else:
-                if '全局' not in gMemory:
-                    gMemory['全局'] = {}
-                if '知识缓存' not in gMemory['全局']:
-                    gMemory['全局']['知识缓存'] = {}
-                for k, v in knowledge_data.items():
-                    if (
-                        type(k) is str
-                        and type(v) is str
-                    ):
-                        gMemory['全局']['知识缓存'][k] = v
-                        log(f'[更新知识] - {k}\n{v}')
+                knowledge_data = {}
+                flag_knowledge_err = True
+            if flag_knowledge_err:
+                for knowledge_data_str_i in knowledge_data_str.split('\n'):
+                    try:
+                        knowledge_data_i = json.loads(knowledge_data_str_i)
+                        if type(knowledge_data_i) is dict:
+                            knowledge_data.update(**knowledge_data_i)
+                    except Exception:
+                        pass
+            if '全局' not in gMemory:
+                gMemory['全局'] = {}
+            if '知识缓存' not in gMemory['全局']:
+                gMemory['全局']['知识缓存'] = {}
+            for k, v in knowledge_data.items():
+                flag_knowledge_update = True
+                if (
+                    type(k) is str
+                    and type(v) is str
+                ):
+                    gMemory['全局']['知识缓存'][k] = v
+                    log(f'[更新知识] - {k}\n{v}')
+            if flag_knowledge_update:
                 write_memory()
         except Exception as e:
             warn(f'API FATAL: {e}')

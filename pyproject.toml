@@ -3,9 +3,9 @@ requires = ["setuptools>=63.2.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "olivos-plugin-OlivOSPluginTemplate"
-version = "1.0.0"
-description = "这是OlivOS官方插件模板，而这是一条有关插件的简介。"
+name = "napcat-aichat-assassin"
+version = "2.0.0"
+description = "NapCat-based group chat assassin with OpenAI-compatible fallback transport"
 readme = "README.md"
 requires-python = ">=3.7"
 authors = []
@@ -19,9 +19,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "olivos",
+    "requests>=2.31.0",
 ]
 
 [project.urls]
-Repository = "https://github.com/OlivOS-Team/OlivOSPluginTemplate"
-Issues = "https://github.com/OlivOS-Team/OlivOSPluginTemplate/issues"
+Repository = "https://github.com/lunzhiPenxil/OlivOSAIChatAssassin"
+Issues = "https://github.com/lunzhiPenxil/OlivOSAIChatAssassin/issues"
+
+[project.scripts]
+napcat-aichat-assassin = "OlivOSAIChatAssassin.main:main"

@@ -19,7 +19,7 @@ gConfigPath = './plugin/data/OlivOSAIChatAssassin/config.json'
 
 gSkipStr = '【SKIP】'
 
-gGroupLock: 'dict[str, threading.Lock]' = {}
+gGroupLock: 'dict[str, FairLock]' = {}
 gGroupKnowledgeCounter: 'dict[str, int]' = {}
 gGroupKnowledgeCounterLimit: int = int(4 * 4)
 
@@ -59,7 +59,7 @@ configDefault = {
 }
 
 
-class Event(object):
+class Event:
     def init(plugin_event, Proc):
         # 初始化流程
         pass
@@ -88,7 +88,7 @@ class Event(object):
     def group_message(plugin_event, Proc):
         # 群消息事件入口
         group_id = str(plugin_event.data.group_id)
-        gGroupLock.setdefault(group_id, threading.Lock())
+        gGroupLock.setdefault(group_id, FairLock())
         missed = gGroupLock[group_id].locked()
         gGroupLock[group_id].acquire()
         unity_group_message(plugin_event, Proc, missed)
@@ -110,6 +110,36 @@ class Event(object):
             elif plugin_event.data.event == 'OlivOSAIChatAssassin_Menu_Status':
                 status = get_status()
                 log(status)
+
+
+# 公平锁
+class FairLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._next_ticket = 0
+        self._serving = 0
+        self._held = False  # 是否被持有
+
+    def acquire(self):
+        with self._lock:
+            my_ticket = self._next_ticket
+            self._next_ticket += 1
+            while my_ticket != self._serving:
+                self._cond.wait()
+            self._held = True
+
+    def release(self):
+        with self._lock:
+            if not self._held:
+                raise RuntimeError("release unlocked lock")
+            self._held = False
+            self._serving += 1
+            self._cond.notify_all()
+
+    def locked(self):
+        with self._lock:
+            return self._held
 
 
 def load_config():
@@ -214,7 +244,7 @@ def unity_group_message(plugin_event, Proc, missed: bool = False):
     )
     # 决定是否回复
     if missed:
-        log('MISSED')
+        log(f'MISSED - {message}')
     elif not should_reply(group_id, message, plugin_event):
         log('SHOULD NOT')
     else:

@@ -222,6 +222,52 @@ def get_recommend_match(rank: int, gate_rank: int = 1000):
     return rank < gate_rank
 
 
+class FairLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._next_ticket = 0
+        self._serving = 0
+        self._held = False
+        self._count = 0
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+    def acquire(self):
+        with self._lock:
+            my_ticket = self._next_ticket
+            self._next_ticket += 1
+            self._count += 1
+            while my_ticket != self._serving:
+                self._cond.wait()
+            self._held = True
+
+    def release(self):
+        with self._lock:
+            if not self._held:
+                raise RuntimeError('release unlocked lock')
+            self._held = False
+            self._serving += 1
+            self._count -= 1
+            self._cond.notify_all()
+            if self._count == 0:
+                self._next_ticket = 0
+                self._serving = 0
+
+    def locked(self):
+        with self._lock:
+            return self._held
+
+    def is_last(self):
+        with self._lock:
+            return self._count == 1
+
+
 class AssassinBot:
     def __init__(self, root_dir):
         self.root_dir = root_dir
@@ -318,7 +364,7 @@ class AssassinBot:
     def get_group_lock(self, group_id):
         key = str(group_id)
         if key not in self.group_locks:
-            self.group_locks[key] = threading.Lock()
+            self.group_locks[key] = FairLock()
         return self.group_locks[key]
 
     def append_history(self, group_id, role, sender, text, user_id=''):
@@ -473,7 +519,7 @@ class AssassinBot:
         time.sleep(wait_seconds)
         self.napcat.send_group_message(group_id, text, reply_to_message_id=message_id)
 
-    def handle_group_message(self, event):
+    def handle_group_message(self, event, missed=False):
         self.reload_runtime()
         group_id = str(event.get('group_id', '')).strip()
         self_id = str(event.get('self_id', '')).strip()
@@ -489,6 +535,10 @@ class AssassinBot:
         user_id = str(event.get('user_id', '')).strip()
         summary = build_message_summary(message_text)
         self.append_history(group_id, 'user', sender_name, summary, user_id)
+
+        if missed:
+            self.info(f'MISSED - {summary}')
+            return
 
         if not self.should_reply_by_rule(message_text, self_id):
             return
@@ -522,10 +572,13 @@ class AssassinBot:
 
         group_id = str(event.get('group_id', '')).strip()
         lock = self.get_group_lock(group_id)
-        if lock.locked():
+        missed = lock.locked()
+        if missed:
             self.info(f'群 {group_id} 有未处理消息，当前消息排队。')
         with lock:
-            self.handle_group_message(event)
+            if lock.is_last():
+                missed = False
+            self.handle_group_message(event, missed)
 
     def serve_forever(self):
         self.initialize()

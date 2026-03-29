@@ -26,6 +26,31 @@ pub fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> anyhow::Result
     Ok(())
 }
 
+pub fn write_json_pretty_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent dir: {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(value)?;
+    let file_name = path.file_name().and_then(|item| item.to_str()).unwrap_or("data.json");
+    let temp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    std::fs::write(&temp_path, text)
+        .with_context(|| format!("failed to write temp file: {}", temp_path.display()))?;
+    if path.exists() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to replace existing file: {}", path.display()));
+            }
+        }
+    }
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("failed to replace file: {}", path.display()))?;
+    Ok(())
+}
+
 pub fn build_message_summary(message: &str) -> String {
     let normalized = message
         .replace('\r', " ")

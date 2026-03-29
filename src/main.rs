@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 const SKIP_TEXT: &str = "【SKIP】";
+const MIN_CAINBOT_EXCLUSIVE_GROUPS_HEARTBEAT_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct MemoryFile {
@@ -67,7 +68,13 @@ struct AppState {
     group_locks: Mutex<HashMap<String, Arc<GroupGate>>>,
     openai: Mutex<OpenAiCompatClient>,
     napcat: NapcatClient,
-    last_cainbot_payload: Mutex<Option<String>>,
+    cainbot_sync_state: Mutex<CainbotSyncState>,
+}
+
+#[derive(Debug, Default)]
+struct CainbotSyncState {
+    last_signature: Option<String>,
+    last_write_at_ms: u64,
 }
 
 struct GroupGate {
@@ -110,10 +117,11 @@ async fn main() -> anyhow::Result<()> {
         group_locks: Mutex::new(HashMap::new()),
         openai: Mutex::new(openai),
         napcat,
-        last_cainbot_payload: Mutex::new(None),
+        cainbot_sync_state: Mutex::new(CainbotSyncState::default()),
     });
 
-    sync_cainbot_exclusive_groups_file(&state).await?;
+    sync_cainbot_exclusive_groups_file(&state).await;
+    spawn_cainbot_exclusive_groups_heartbeat(Arc::clone(&state));
     util::info("NapCatAIChatAssassin Rust 版已启动。");
 
     let shutdown = shutdown_signal();
@@ -323,7 +331,7 @@ async fn reload_runtime(state: &Arc<AppState>) -> anyhow::Result<()> {
         *guard = OpenAiCompatClient::new(config.ai.clone())?;
     }
     shrink_history(state, config.bot.history_size).await;
-    sync_cainbot_exclusive_groups_file(state).await?;
+    sync_cainbot_exclusive_groups_file(state).await;
     Ok(())
 }
 
@@ -510,24 +518,65 @@ async fn get_group_lock(state: &Arc<AppState>, group_id: &str) -> Arc<GroupGate>
         .clone()
 }
 
-async fn sync_cainbot_exclusive_groups_file(state: &Arc<AppState>) -> anyhow::Result<()> {
+fn spawn_cainbot_exclusive_groups_heartbeat(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let heartbeat_seconds = {
+                let config = state.config.lock().await.clone();
+                cainbot_exclusive_groups_heartbeat_seconds(&config)
+            };
+            tokio::time::sleep(Duration::from_secs(heartbeat_seconds)).await;
+            sync_cainbot_exclusive_groups_file(&state).await;
+        }
+    });
+}
+
+async fn sync_cainbot_exclusive_groups_file(state: &Arc<AppState>) {
+    if let Err(error) = sync_cainbot_exclusive_groups_file_inner(state).await {
+        util::warn(&format!("同步 CainBot 互斥群文件失败: {error}"));
+    }
+}
+
+async fn sync_cainbot_exclusive_groups_file_inner(state: &Arc<AppState>) -> anyhow::Result<()> {
     let config = state.config.lock().await.clone();
     if !config.integration.write_cainbot_exclusive_groups {
         return Ok(());
     }
-    let payload = build_cainbot_exclusive_groups_payload(&config);
-    let serialized = serde_json::to_string_pretty(&payload)?;
+    let signature = build_cainbot_exclusive_groups_signature(&config);
+    let heartbeat_ms = cainbot_exclusive_groups_heartbeat_seconds(&config).saturating_mul(1000);
+    let now_ms = current_time_ms();
     let target_path = get_cainbot_exclusive_groups_file_path(&state.root_dir, &config);
-    let mut last = state.last_cainbot_payload.lock().await;
-    if last.as_ref() == Some(&serialized) && target_path.exists() {
+    let mut sync_state = state.cainbot_sync_state.lock().await;
+    let should_write = sync_state.last_signature.as_ref() != Some(&signature)
+        || !target_path.exists()
+        || now_ms.saturating_sub(sync_state.last_write_at_ms) >= heartbeat_ms;
+    if !should_write {
         return Ok(());
     }
-    util::write_json_pretty(&target_path, &payload)?;
-    *last = Some(serialized);
+    let payload = build_cainbot_exclusive_groups_payload(&config, util::now_iso());
+    util::write_json_pretty_atomic(&target_path, &payload)?;
+    sync_state.last_signature = Some(signature);
+    sync_state.last_write_at_ms = now_ms;
     Ok(())
 }
 
-fn build_cainbot_exclusive_groups_payload(config: &Config) -> Value {
+fn build_cainbot_exclusive_groups_signature(config: &Config) -> String {
+    let (mode, group_ids) = build_cainbot_exclusive_groups_scope(config);
+    format!("{mode}:{}", group_ids.join(","))
+}
+
+fn build_cainbot_exclusive_groups_payload(config: &Config, updated_at: String) -> Value {
+    let (mode, group_ids) = build_cainbot_exclusive_groups_scope(config);
+    json!({
+        "version": 1,
+        "source": "NapCatAIChatAssassin",
+        "updatedAt": updated_at,
+        "mode": mode,
+        "groupIds": group_ids,
+    })
+}
+
+fn build_cainbot_exclusive_groups_scope(config: &Config) -> (String, Vec<String>) {
     let enabled_groups = config
         .bot
         .enabled_groups
@@ -535,19 +584,31 @@ fn build_cainbot_exclusive_groups_payload(config: &Config) -> Value {
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect::<Vec<_>>();
-    let mode = if enabled_groups.iter().any(|item| item == "all") { "all" } else { "list" };
+    let mode = if enabled_groups.iter().any(|item| item == "all") {
+        "all".to_string()
+    } else {
+        "list".to_string()
+    };
     let group_ids = if mode == "all" {
         Vec::<String>::new()
     } else {
         enabled_groups.into_iter().filter(|item| item != "all").collect::<Vec<_>>()
     };
-    json!({
-        "version": 1,
-        "source": "NapCatAIChatAssassin",
-        "updatedAt": util::now_iso(),
-        "mode": mode,
-        "groupIds": group_ids,
-    })
+    (mode, group_ids)
+}
+
+fn cainbot_exclusive_groups_heartbeat_seconds(config: &Config) -> u64 {
+    config
+        .integration
+        .cainbot_exclusive_groups_heartbeat_seconds
+        .max(MIN_CAINBOT_EXCLUSIVE_GROUPS_HEARTBEAT_SECONDS)
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn is_group_enabled(config: &Config, group_id: &str) -> bool {

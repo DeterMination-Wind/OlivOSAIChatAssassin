@@ -158,6 +158,8 @@ pub struct IntegrationConfig {
     pub write_cainbot_exclusive_groups: bool,
     #[serde(default)]
     pub cainbot_exclusive_groups_file: String,
+    #[serde(default = "default_cainbot_exclusive_groups_heartbeat_seconds")]
+    pub cainbot_exclusive_groups_heartbeat_seconds: u64,
 }
 
 impl Default for IntegrationConfig {
@@ -165,6 +167,7 @@ impl Default for IntegrationConfig {
         Self {
             write_cainbot_exclusive_groups: true,
             cainbot_exclusive_groups_file: String::new(),
+            cainbot_exclusive_groups_heartbeat_seconds: default_cainbot_exclusive_groups_heartbeat_seconds(),
         }
     }
 }
@@ -257,6 +260,10 @@ fn default_failure_cooldown_threshold() -> u32 {
 
 fn default_enabled_groups() -> Vec<String> {
     vec!["all".to_string()]
+}
+
+fn default_cainbot_exclusive_groups_heartbeat_seconds() -> u64 {
+    30
 }
 
 fn default_history_size() -> usize {

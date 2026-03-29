@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
         'event_base_url': 'http://127.0.0.1:3000',
         'event_path': '/_events',
         'headers': {},
-        'request_timeout_ms': 20000
+        'request_timeout_ms': 20000,
     },
     'ai': {
         'api_key': '',
@@ -78,7 +78,7 @@ DEFAULT_CONFIG = {
             'gpt-5.2',
             'deepseek-ai/deepseek-v3.2',
             'deepseek-ai/deepseek-v3.1-terminus',
-            'gpt-5-codex-mini'
+            'gpt-5-codex-mini',
         ],
         'reply_model': '',
         'filter_model': '',
@@ -89,7 +89,7 @@ DEFAULT_CONFIG = {
         'retry_delay_ms': 1500,
         'request_timeout_ms': 90000,
         'failure_cooldown_ms': 60000,
-        'failure_cooldown_threshold': 2
+        'failure_cooldown_threshold': 2,
     },
     'bot': {
         'enabled_groups': ['all'],
@@ -102,8 +102,8 @@ DEFAULT_CONFIG = {
         'reply_delay_seconds': [0.8, 1.8],
         'record_memory': True,
         'persona_prompt': DEFAULT_PERSONA_PROMPT,
-        'filter_prompt': DEFAULT_FILTER_PROMPT
-    }
+        'filter_prompt': DEFAULT_FILTER_PROMPT,
+    },
 }
 
 
@@ -178,14 +178,60 @@ def build_message_summary(message):
     return text[:360] or '(无可读文本)'
 
 
+def get_recommend_rank(word1_in: str, word2_in: str, gate_rank: int = 1000, rate: float = 0.1):
+    word1 = str(word1_in or '').lower()
+    word2 = str(word2_in or '').lower()
+    if not word1 or not word2:
+        return gate_rank + 1
+    if len(word1) > len(word2):
+        return gate_rank + 2
+    word1_len = len(word1)
+    word2_len = len(word2)
+    find_flag = 0 if word2.find(word1) != -1 else 1
+
+    dp1 = [[0] * (word1_len + 1) for _ in range(word2_len + 1)]
+    for i in range(1, word1_len + 1):
+        for j in range(1, word2_len + 1):
+            if word1[i - 1] == word2[j - 1]:
+                dp1[j][i] = dp1[j - 1][i - 1] + 1
+            else:
+                dp1[j][i] = max(dp1[j - 1][i], dp1[j][i - 1])
+    lcs_rank = dp1[word2_len][word1_len]
+
+    dp2 = [[0] * (word1_len + 1) for _ in range(word2_len + 1)]
+    for i in range(word1_len + 1):
+        dp2[0][i] = i
+    for j in range(word2_len + 1):
+        dp2[j][0] = j
+    for i in range(1, word1_len + 1):
+        for j in range(1, word2_len + 1):
+            if word1[i - 1] == word2[j - 1]:
+                dp2[j][i] = dp2[j - 1][i - 1]
+            else:
+                dp2[j][i] = min(dp2[j - 1][i - 1], dp2[j - 1][i], dp2[j][i - 1]) + 1
+    distance_rank = dp2[word2_len][word1_len]
+
+    rank = find_flag * (word2_len * (word1_len - lcs_rank) + distance_rank + 1)
+    rank = int(int((rank * rank) / word1_len) / word2_len)
+    if rank >= int(word1_len * word2_len * rate):
+        rank += gate_rank
+    return rank
+
+
+def get_recommend_match(rank: int, gate_rank: int = 1000):
+    return rank < gate_rank
+
+
 class AssassinBot:
     def __init__(self, root_dir):
         self.root_dir = root_dir
         self.data_dir = os.path.join(root_dir, 'data')
+        self.knowledge_dir = os.path.join(self.data_dir, 'Knowledge')
         self.config_path = os.path.join(self.data_dir, 'config.json')
         self.memory_path = os.path.join(self.data_dir, 'memory.json')
         self.config = None
         self.memory = {}
+        self.static_knowledge = {}
         self.message_history = {}
         self.group_locks = {}
         self.reload_lock = threading.Lock()
@@ -211,6 +257,26 @@ class AssassinBot:
         self.config = merge_defaults(loaded, DEFAULT_CONFIG)
         return self.config
 
+    def load_static_knowledge(self):
+        self.static_knowledge = {}
+        os.makedirs(self.knowledge_dir, exist_ok=True)
+        for name in os.listdir(self.knowledge_dir):
+            file_path = os.path.join(self.knowledge_dir, name)
+            if not os.path.isfile(file_path):
+                continue
+            try:
+                with open(file_path, 'r', encoding='utf-8') as file:
+                    loaded = json.load(file)
+                if not isinstance(loaded, dict):
+                    self.warn(f'加载知识库[{name}]失败: 类型错误[{type(loaded)}]')
+                    continue
+                self.static_knowledge.update(loaded)
+                self.info(f'已加载知识库[{name}]')
+            except Exception as error:
+                self.warn(f'加载知识库[{name}]失败: {error}')
+        self.info(f'已加载知识库共[{len(self.static_knowledge)}]条')
+        return self.static_knowledge
+
     def load_memory(self):
         os.makedirs(self.data_dir, exist_ok=True)
         if os.path.exists(self.memory_path):
@@ -228,6 +294,7 @@ class AssassinBot:
 
     def initialize(self):
         self.load_config()
+        self.load_static_knowledge()
         self.load_memory()
         self.napcat = NapCatClient(self.config['napcat'], self.info, self.warn)
         self.openai = OpenAICompatClient(self.config['ai'], self.info, self.warn)
@@ -236,6 +303,7 @@ class AssassinBot:
     def reload_runtime(self):
         with self.reload_lock:
             self.load_config()
+            self.load_static_knowledge()
             self.load_memory()
             self.napcat.update_config(self.config['napcat'])
             self.openai.update_config(self.config['ai'])
@@ -262,7 +330,7 @@ class AssassinBot:
             'sender': sender,
             'user_id': str(user_id or ''),
             'text': str(text or '')[:600],
-            'time': datetime.now().astimezone().replace(microsecond=0).isoformat()
+            'time': datetime.now().astimezone().replace(microsecond=0).isoformat(),
         })
 
     def build_timeline(self, group_id, limit=12):
@@ -300,7 +368,7 @@ class AssassinBot:
             messages=messages,
             model=model_override,
             temperature=self.config['ai']['temperature'] if temperature is None else temperature,
-            max_tokens=self.config['ai']['max_tokens']
+            max_tokens=self.config['ai']['max_tokens'],
         ).strip()
 
     def update_group_memory(self, group_id):
@@ -308,7 +376,7 @@ class AssassinBot:
             return
         messages = [
             {'role': 'system', 'content': '你负责把一个群最近聊天压缩成 120 字以内的长期记忆。不要流水账，只保留对后续聊天有价值的信息。只输出记忆文本。'},
-            {'role': 'user', 'content': self.build_timeline(group_id, 20)}
+            {'role': 'user', 'content': self.build_timeline(group_id, 20)},
         ]
         try:
             memory_text = self.call_ai(messages, model_key='memory_model', temperature=0.3)
@@ -317,25 +385,84 @@ class AssassinBot:
         except Exception as error:
             self.warn(f'更新群记忆失败: {error}')
 
+    def build_selected_knowledge(self, group_id):
+        timeline_entries = list(self.message_history.get(str(group_id), []))[-20:]
+        if not timeline_entries:
+            return {}
+
+        global_memory = self.memory.get('全局', {})
+        selected = {}
+        selected_search = {}
+        knowledge_sources = (
+            ('知识缓存', global_memory.get('知识缓存', {}), 0.1),
+            ('知识库', self.static_knowledge, 0.15),
+            ('知识搜索', global_memory.get('知识搜索', {}), 0.1),
+        )
+        for source_name, knowledge_map, rate in knowledge_sources:
+            if not isinstance(knowledge_map, dict):
+                continue
+            for keyword, content in knowledge_map.items():
+                if not isinstance(keyword, str) or not isinstance(content, str):
+                    continue
+                hit_rank = None
+                for entry in timeline_entries:
+                    hit_rank = get_recommend_rank(keyword, entry.get('text', ''), rate=rate)
+                    if get_recommend_match(hit_rank):
+                        self.info(f'PEAK UP - [{source_name}] {keyword} ({hit_rank})')
+                        selected_search[keyword] = content
+                        break
+
+        for key, value in global_memory.items():
+            if key not in ('人物关系', '知识缓存', '知识搜索', '知识库', '群记忆'):
+                selected[key] = value
+        if selected_search:
+            selected['知识搜索'] = selected_search
+        relationships = global_memory.get('人物关系', {})
+        if isinstance(relationships, dict):
+            selected_relationships = {}
+            for user_key, relation in relationships.items():
+                flag_hit = False
+                for entry in timeline_entries:
+                    if user_key == entry.get('user_id'):
+                        flag_hit = True
+                        break
+                    if isinstance(relation, list) and relation:
+                        first = relation[0]
+                        aliases = first if isinstance(first, list) else [first]
+                        for alias in aliases:
+                            if isinstance(alias, str) and alias.lower() in entry.get('text', '').lower():
+                                flag_hit = True
+                                break
+                        if flag_hit:
+                            break
+                if flag_hit:
+                    selected_relationships[user_key] = relation
+            if selected_relationships:
+                selected['人物关系'] = selected_relationships
+        return selected
+
     def build_reply_messages(self, group_id, self_id, current_text):
         long_memory = self.memory.get('全局', {}).get('群记忆', {}).get(str(group_id), '')
-        prompt = '\n\n'.join([
+        selected_knowledge = self.build_selected_knowledge(group_id)
+        prompt_parts = [
             self.config['bot']['persona_prompt'],
             f'你当前所在群号：{group_id}',
             f'你的 QQ 号：{self_id}',
             '如果你不想参与当前对话，必须只输出“【SKIP】”。',
             '你可以参考最近上下文和本群记忆决定是否接话。',
-            f'本群长期记忆：{long_memory or "暂无"}'
-        ])
+            f'本群长期记忆：{long_memory or "暂无"}',
+        ]
+        if selected_knowledge:
+            prompt_parts.append(f'命中的知识与关系：{json.dumps(selected_knowledge, ensure_ascii=False)}')
         return [
-            {'role': 'system', 'content': prompt},
+            {'role': 'system', 'content': '\n\n'.join(prompt_parts)},
             {'role': 'user', 'content': '\n'.join([
                 '最近共享上下文：',
                 self.build_timeline(group_id, 20),
                 '',
                 '本次最新消息：',
-                current_text
-            ])}
+                current_text,
+            ])},
         ]
 
     def send_reply(self, group_id, message_id, text):

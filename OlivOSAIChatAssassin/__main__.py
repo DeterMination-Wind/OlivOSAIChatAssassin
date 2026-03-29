@@ -5,12 +5,21 @@ import sys
 
 def main():
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    release_binary = os.path.join(repo_root, 'target', 'release', 'napcat-aichat-assassin-rs.exe')
-    debug_binary = os.path.join(repo_root, 'target', 'debug', 'napcat-aichat-assassin-rs.exe')
+    binary_names = (
+        'napcat-aichat-assassin-rs.exe',
+        'napcat-aichat-assassin-rs',
+    )
+    candidate_dirs = (
+        repo_root,
+        os.path.join(repo_root, 'target', 'release'),
+        os.path.join(repo_root, 'target', 'debug'),
+    )
 
-    for candidate in (release_binary, debug_binary):
-        if os.path.exists(candidate):
-            raise SystemExit(subprocess.call([candidate]))
+    for base_dir in candidate_dirs:
+        for binary_name in binary_names:
+            candidate = os.path.join(base_dir, binary_name)
+            if os.path.exists(candidate):
+                raise SystemExit(subprocess.call([candidate]))
 
     message = (
         'Python 入口已降级为兼容跳板，当前仓库的正式运行入口是 Rust 二进制。\n'

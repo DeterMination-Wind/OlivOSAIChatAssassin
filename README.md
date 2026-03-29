@@ -1,6 +1,7 @@
 # NapCat AI Chat Assassin
 
 基于 NapCat 的智能群聊对话机器人，具有拟人化的回复能力和长期记忆功能。
+当前仓库已切换为 Rust 作为正式运行与发布入口，Python 代码仅作兼容与迁移参考保留。
 
 ## 概述
 
@@ -16,21 +17,35 @@
 
 ## 快速开始
 
-### 安装依赖
+### 构建环境
 
 ```bash
-pip install -e .
+cargo --version
 ```
 
-### 启动服务
+### 开发运行
 
 ```bash
-python -m OlivOSAIChatAssassin
+cargo run
+```
+
+### 正式构建
+
+```bash
+cargo build --release
+```
+
+Windows 打包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
 ```
 
 首次运行会在项目根目录创建配置文件和记忆文件：
 - `data/config.json` - 配置文件
 - `data/memory.json` - 记忆数据
+
+`data/` 被视为运行时目录，不作为正式发布源码的一部分提交。仓库只保留 `data/Knowledge/` 空目录占位，其他运行期生成文件默认忽略。
 
 ## 配置说明
 
@@ -86,6 +101,14 @@ python -m OlivOSAIChatAssassin
 3. **记忆管理**:
    - 每次成功回复后异步更新群聊长期记忆
    - 记忆用于维持对话连贯性
+
+## 入口与发布
+
+- 正式运行入口：`cargo run`
+- 正式发布入口：`cargo build --release`
+- Windows 发布脚本：`scripts/build-release.ps1`
+- Python 的 `python -m OlivOSAIChatAssassin` 现在只会尝试转发到已构建的 Rust 可执行文件
+- 如果本地还没构建 Rust 二进制，这个 Python 入口会直接报错并提示正确用法
 
 ## 许可证
 

@@ -808,6 +808,7 @@ def reply_wash(msg: str):
     res = res.rstrip('。')
     res = re.sub(r'\(.+\)', '', res)
     res = re.sub(r'（.+）', '', res)
+    res = res.replace('[SKIP]', '【SKIP】')
     return res
 
 

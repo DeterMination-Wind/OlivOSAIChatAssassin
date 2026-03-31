@@ -827,6 +827,8 @@ def reply_split(msg: str):
 def msg_wash(msg: str):
     res = msg
     res = re.sub(r'\[OP:image.+\]', '', res)
+    res = re.sub(r'\[OP:record.+\]', '', res)
+    res = re.sub(r'\[OP:video.+\]', '', res)
     return res
 
 

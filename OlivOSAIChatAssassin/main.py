@@ -259,8 +259,12 @@ def unity_group_message(plugin_event, Proc, missed: bool = False):
         gMessageHistory[group_id] = deque(
             maxlen=gConfig.get('history_size', configDefault['history_size'])
         )
+    message_id = plugin_event.data.message_id
+    if -1 == message_id:
+        message_id = None
     add_message_to_history(
-        group_id, message, plugin_event.data.user_id, plugin_event.data.sender.get('nickname', '用户')
+        group_id, message, plugin_event.data.user_id, plugin_event.data.sender.get('nickname', '用户'),
+        message_id=message_id
     )
     # 决定是否回复
     if missed:
@@ -283,7 +287,7 @@ def should_ignore(message):
     return False
 
 
-def add_message_to_history(group_id, message, user_id, nickname):
+def add_message_to_history(group_id, message, user_id, nickname, message_id: 'str|None' = None):
     if group_id not in gMessageHistory:
         return
     timestamp = time.time()
@@ -297,6 +301,8 @@ def add_message_to_history(group_id, message, user_id, nickname):
         'nickname': nickname,
         'message': message_new
     }
+    if message_id is not None:
+        msg_entry['message_id'] = str(message_id)
     gMessageHistory[group_id].append(msg_entry)
 
 

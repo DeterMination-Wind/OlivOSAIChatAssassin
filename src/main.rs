@@ -1098,7 +1098,7 @@ fn sample_reply_delay(config: &Config) -> f64 {
 fn render_message(message: Option<&Value>, raw_message: Option<&str>) -> String {
     if let Some(message) = message {
         if let Some(text) = message.as_str() {
-            return text.to_string();
+            return sanitize_raw_message_text(text);
         }
         if let Some(items) = message.as_array() {
             let mut parts = Vec::new();
@@ -1126,7 +1126,27 @@ fn render_message(message: Option<&Value>, raw_message: Option<&str>) -> String 
             }
         }
     }
-    raw_message.unwrap_or_default().to_string()
+    sanitize_raw_message_text(raw_message.unwrap_or_default())
+}
+
+fn sanitize_raw_message_text(text: &str) -> String {
+    strip_op_markers(text, &["record", "video"])
+}
+
+fn strip_op_markers(text: &str, segment_types: &[&str]) -> String {
+    let mut output = text.to_string();
+    for segment_type in segment_types {
+        let marker = format!("[OP:{segment_type}");
+        while let Some(start) = output.find(&marker) {
+            let Some(relative_end) = output[start..].find(']') else {
+                output.truncate(start);
+                break;
+            };
+            let end = start + relative_end + 1;
+            output.replace_range(start..end, "");
+        }
+    }
+    output
 }
 
 fn load_or_create_memory(path: &Path) -> anyhow::Result<MemoryFile> {

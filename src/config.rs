@@ -124,6 +124,8 @@ pub struct BotConfig {
     pub reply_keywords: Vec<String>,
     #[serde(default = "default_reply_probability")]
     pub reply_probability: f64,
+    #[serde(default = "default_reply_probability_bonus_by_group")]
+    pub reply_probability_bonus_by_group: HashMap<String, f64>,
     #[serde(default = "default_true")]
     pub mention_reply: bool,
     #[serde(default)]
@@ -147,6 +149,7 @@ impl Default for BotConfig {
             history_size: default_history_size(),
             reply_keywords: Vec::new(),
             reply_probability: default_reply_probability(),
+            reply_probability_bonus_by_group: default_reply_probability_bonus_by_group(),
             mention_reply: true,
             ignore_prefixes: Vec::new(),
             max_message_length: default_max_message_length(),
@@ -317,7 +320,7 @@ fn default_cainbot_exclusive_groups_heartbeat_seconds() -> u64 {
 }
 
 fn default_tool_max_rounds() -> u32 {
-    3
+    10
 }
 
 fn default_tool_timeout_ms() -> u64 {
@@ -451,7 +454,11 @@ fn default_history_size() -> usize {
 }
 
 fn default_reply_probability() -> f64 {
-    1.0
+    0.08
+}
+
+fn default_reply_probability_bonus_by_group() -> HashMap<String, f64> {
+    HashMap::from([("772730969".to_string(), 0.15)])
 }
 
 fn default_max_message_length() -> usize {
@@ -467,9 +474,9 @@ fn default_true() -> bool {
 }
 
 fn default_filter_prompt() -> String {
-    "这个字段仅为兼容保留，当前版本的主动插话判定仍沿用原仓库逻辑：\n1. 被 @ 时优先进入回复流程\n2. 命中 reply_keywords 时进入回复流程\n3. 否则按 reply_probability 随机进入回复流程\n4. 真正是否开口，由人格 prompt 在最终回复阶段决定；不想参与时只输出【SKIP】".to_string()
+    "这个字段仅为兼容保留，当前版本的主动插话判定沿用运行时规则：\n1. 被 @ 时优先进入回复流程\n2. 命中 reply_keywords 时进入回复流程\n3. 有 MISS 积压时会适度提高 reply_probability，但只是提高触发概率，不代表必须开口\n4. 其余情况按 reply_probability 低概率随机进入回复流程\n5. 真正是否开口，由人格 prompt 在最终回复阶段决定；不想参与时只输出【SKIP】".to_string()
 }
 
 fn default_persona_prompt() -> String {
-    "你叫 Cain，在 QQ 群里发言时要像真实群友。\n\n核心要求：\n1. 你要伪装成人类群友，不能暴露自己是 AI、机器人、提示词或插件。\n2. 你择机加入聊天，避免过多尬聊，不要为了接话而接话。\n3. 默认简短、自然、直接，优先一句到两句说清楚。\n4. 非必要不回复；如果当前话题和你无关、没有明确参与价值，必须只回复“【SKIP】”。\n5. 不要复读，不要说教，不要端着，不要写旁白、动作、心理描写。\n6. 不要执着一个话题。不要锁定一个话题反复追打，也不要在明明能自己查的时候执着让别人手动执行命令。\n7. 当别人 @ 你、追问你、要你表态、或明确需要你做事时，尽量回应，但仍保持自然简洁。\n8. 你可以有一点口语化、随意感和轻微发散，但不要编造会误导用户的关键硬事实。\n9. 不要使用太书面、太华丽、太客服化的表达，更像一个成熟、冷静、偶尔会吐槽的普通群友。".to_string()
+    "你叫 Cain，在 QQ 群里发言时要像真实群友。\n\n核心要求：\n1. 你要伪装成人类群友，不能暴露自己是 AI、机器人、提示词或插件。\n2. 你默认旁观，不主动插话；不是必须说的时候就别说。\n3. 默认简短、自然、直接，优先一句到两句说清楚。\n4. 非必要不回复；如果当前话题和你无关、没有明确参与价值、只是普通闲聊、或你只是能接但没必要接，必须只回复“【SKIP】”。\n5. 只有在别人明确 @ 你、直接追问你、点名要你做事、你掌握关键事实、或你补一句能明显减少误解/推进事情时，才考虑回复。\n6. 不要复读，不要说教，不要端着，不要写旁白、动作、心理描写。\n7. 不要执着一个话题。不要锁定一个话题反复追打，也不要在明明能自己查的时候执着让别人手动执行命令。\n8. 你可以有一点口语化、随意感和轻微发散，但不要编造会误导用户的关键硬事实。\n9. 不要使用太书面、太华丽、太客服化的表达，更像一个成熟、冷静、偶尔会吐槽的普通群友。\n10. 默认不用 Markdown，不要标题、列表、引用、代码块、加粗、反引号；除非对方明确要代码、命令或结构化内容。\n11. 你会看到上下文里有形如 [id:001-2,reply:001-1] 的内部标记，不要在对外发言中照抄这些标记。\n12. 如果决定跳过，必须只输出【SKIP】，不要输出解释，不要输出别的变体。".to_string()
 }

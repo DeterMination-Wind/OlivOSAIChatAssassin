@@ -28,18 +28,23 @@ impl NapcatClient {
         group_id: &str,
         text: &str,
         reply_to_message_id: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         let mut message = Vec::<Value>::new();
         if let Some(id) = reply_to_message_id {
             message.push(serde_json::json!({"type":"reply","data":{"id":id}}));
         }
         message.push(serde_json::json!({"type":"text","data":{"text":text}}));
-        self.call(
+        let data = self.call(
             "send_group_msg",
             serde_json::json!({"group_id": group_id, "message": message}),
         )
         .await?;
-        Ok(())
+        let message_id = data
+            .get("message_id")
+            .or_else(|| data.get("messageId"))
+            .map(value_to_string)
+            .filter(|value| !value.trim().is_empty());
+        Ok(message_id)
     }
 
     pub async fn send_local_file_to_group(
@@ -177,4 +182,13 @@ fn parse_sse_block(block: &str) -> Option<Value> {
 
 fn truncate(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
+}
+
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        _ => String::new(),
+    }
 }

@@ -1,10 +1,11 @@
 mod config;
+mod mission;
 mod napcat;
 mod openai;
 mod tools;
 mod util;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,6 +49,9 @@ struct GlobalMemory {
     #[serde(default)]
     #[serde(rename = "人物关系")]
     relationships: HashMap<String, Value>,
+    #[serde(default)]
+    #[serde(rename = "群上下文前缀")]
+    timeline_group_prefixes: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +61,8 @@ struct HistoryEntry {
     user_id: String,
     text: String,
     time: String,
+    message_id: Option<String>,
+    reply_to_message_id: Option<String>,
 }
 
 struct AppState {
@@ -68,6 +74,7 @@ struct AppState {
     memory: Mutex<MemoryFile>,
     static_knowledge: Mutex<HashMap<String, String>>,
     message_history: Mutex<HashMap<String, VecDeque<HistoryEntry>>>,
+    missed_backlog: Mutex<HashMap<String, usize>>,
     group_locks: Mutex<HashMap<String, Arc<GroupGate>>>,
     openai: Mutex<OpenAiCompatClient>,
     napcat: NapcatClient,
@@ -84,6 +91,16 @@ struct CainbotSyncState {
 struct GroupGate {
     lock: Mutex<()>,
     pending: AtomicUsize,
+}
+
+#[derive(Debug, Clone)]
+struct ReplyRuleDecision {
+    should_reply: bool,
+    reason: String,
+    probability: f64,
+    roll: Option<f64>,
+    backlog_bonus: f64,
+    group_bonus: f64,
 }
 
 impl GroupGate {
@@ -118,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         memory: Mutex::new(memory),
         static_knowledge: Mutex::new(static_knowledge),
         message_history: Mutex::new(HashMap::new()),
+        missed_backlog: Mutex::new(HashMap::new()),
         group_locks: Mutex::new(HashMap::new()),
         openai: Mutex::new(openai),
         tool_executor: ToolExecutor::new(root_dir.clone(), config_path.clone(), napcat.clone())?,
@@ -207,6 +225,11 @@ async fn handle_group_message(state: Arc<AppState>, event: Value, missed: bool) 
 
     let message_text = render_message(event.get("message"), event.get("raw_message").and_then(Value::as_str));
     let message_image_urls = extract_message_image_urls(event.get("message"));
+    let current_message_id = event
+        .get("message_id")
+        .map(value_to_string)
+        .filter(|value| !value.trim().is_empty());
+    let current_reply_to_message_id = extract_reply_to_message_id(event.get("message"));
     if should_ignore(&config, &message_text) {
         return Ok(());
     }
@@ -233,28 +256,50 @@ async fn handle_group_message(state: Arc<AppState>, event: Value, missed: bool) 
         &group_id,
         HistoryEntry {
             role: "user".to_string(),
-            sender: sender_name,
+            sender: sender_name.clone(),
             user_id: user_id_value(&event),
-            text: summary,
+            text: summary.clone(),
             time: util::now_iso(),
+            message_id: current_message_id.clone(),
+            reply_to_message_id: current_reply_to_message_id.clone(),
         },
     )
     .await;
 
     if missed {
-        util::info(&format!("MISSED - {}", message_text.trim()));
+        let backlog = record_missed_backlog(&state, &group_id).await;
+        util::info(&format!(
+            "MISSED - group={group_id} reason=group-gate-busy backlog={backlog} text={}",
+            summary
+        ));
         return Ok(());
     }
 
-    if !should_reply_by_rule(&config, &message_text, &self_id) {
+    let missed_backlog = peek_missed_backlog(&state, &group_id).await;
+    let rule_decision = should_reply_by_rule(&config, &group_id, &message_text, &self_id, missed_backlog);
+    if !rule_decision.should_reply {
+        util::info(&format!(
+            "SKIP-RULE - group={group_id} reason={} probability={:.3} roll={} backlog_bonus={:.3} group_bonus={:.3} text={}",
+            rule_decision.reason,
+            rule_decision.probability,
+            format_roll(rule_decision.roll),
+            rule_decision.backlog_bonus,
+            rule_decision.group_bonus,
+            summary
+        ));
         return Ok(());
     }
+    let missed_backlog = take_missed_backlog(&state, &group_id).await;
 
     let reply_messages = build_reply_messages(
         &state,
         &config,
         &group_id,
         &self_id,
+        missed_backlog,
+        &sender_name,
+        current_message_id.as_deref(),
+        current_reply_to_message_id.as_deref(),
         &message_text,
         &message_image_urls,
     )
@@ -277,7 +322,62 @@ async fn handle_group_message(state: Arc<AppState>, event: Value, missed: bool) 
             return Ok(());
         }
     };
-    if reply_text.trim().is_empty() || reply_text.trim() == SKIP_TEXT {
+    if let Some(skip_reason) = classify_model_skip_reason(&reply_text) {
+        util::info(&format!(
+            "SKIP-AI - group={group_id} reason={skip_reason} probability={:.3} roll={} backlog_bonus={:.3} group_bonus={:.3} text={}",
+            rule_decision.probability,
+            format_roll(rule_decision.roll),
+            rule_decision.backlog_bonus,
+            rule_decision.group_bonus,
+            summary
+        ));
+        return Ok(());
+    }
+    if let Some(mission) = mission::extract_mission_request(&reply_text) {
+        let launch_text = mission::build_mission_launch_text(&mission);
+        let launch_message_id = state
+            .napcat
+            .send_group_message(&group_id, &launch_text, current_message_id.as_deref())
+            .await?;
+        append_history(
+            &state,
+            &config,
+            &group_id,
+            HistoryEntry {
+                role: "assistant".to_string(),
+                sender: "Cain".to_string(),
+                user_id: self_id.clone(),
+                text: launch_text.clone(),
+                time: util::now_iso(),
+                message_id: launch_message_id,
+                reply_to_message_id: current_message_id.clone(),
+            },
+        )
+        .await;
+        tokio::spawn({
+            let state = Arc::clone(&state);
+            let group_id = group_id.clone();
+            let requester = sender_name.clone();
+            let request_text = message_text.clone();
+            let reply_to_message_id = current_message_id.clone();
+            let config = config.clone();
+            async move {
+                if let Err(error) = mission::run_mission_and_report(
+                    state,
+                    config,
+                    group_id,
+                    self_id,
+                    requester,
+                    request_text,
+                    reply_to_message_id,
+                    mission,
+                )
+                .await
+                {
+                    util::warn(&format!("MISSION 执行失败: {error}"));
+                }
+            }
+        });
         return Ok(());
     }
     let final_text: String = reply_text.chars().take(config.bot.max_message_length).collect();
@@ -287,12 +387,12 @@ async fn handle_group_message(state: Arc<AppState>, event: Value, missed: bool) 
 
     let delay = sample_reply_delay(&config);
     tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-    state
+    let sent_message_id = state
         .napcat
         .send_group_message(
             &group_id,
             final_text.trim(),
-            event.get("message_id").map(value_to_string).as_deref(),
+            current_message_id.as_deref(),
         )
         .await?;
     append_history(
@@ -305,6 +405,8 @@ async fn handle_group_message(state: Arc<AppState>, event: Value, missed: bool) 
             user_id: self_id,
             text: final_text.trim().to_string(),
             time: util::now_iso(),
+            message_id: sent_message_id,
+            reply_to_message_id: current_message_id.clone(),
         },
     )
     .await;
@@ -375,20 +477,39 @@ async fn build_reply_messages(
     config: &Config,
     group_id: &str,
     self_id: &str,
+    missed_backlog: usize,
+    current_sender: &str,
+    current_message_id: Option<&str>,
+    current_reply_to_message_id: Option<&str>,
     current_text: &str,
     current_image_urls: &[String],
 ) -> anyhow::Result<Vec<ChatMessage>> {
     let memory = state.memory.lock().await.clone();
     let long_memory = memory.global.group_memory.get(group_id).cloned().unwrap_or_default();
     let selected_knowledge = build_selected_knowledge(state, &memory, group_id).await;
+    let rendered_timeline = render_timeline(state, group_id, 20).await;
+    let current_display_id = current_message_id
+        .and_then(|id| rendered_timeline.message_id_to_display_id.get(id))
+        .map(String::as_str);
+    let current_reply_display_id = current_reply_to_message_id
+        .and_then(|id| rendered_timeline.message_id_to_display_id.get(id))
+        .map(String::as_str);
     let mut prompt_parts = vec![
         config.bot.persona_prompt.clone(),
         format!("你当前所在群号：{group_id}"),
         format!("你的 QQ 号：{self_id}"),
-        "如果你不想参与当前对话，必须只输出“【SKIP】”。".to_string(),
-        "你可以参考最近上下文和本群记忆决定是否接话。".to_string(),
+        "上下文每行格式：[id:PPP-N[,reply:PPP-M]]名字:内容。PPP 为本群唯一三位前缀；reply 表示该消息回复了哪条。不要在对外发言中输出 [id:...] 标签。".to_string(),
+        "默认不要插话。只有在别人明确 @ 你、直接追问你、当前轮明显在问你、或你补一句能显著提高信息价值时才回复；其余情况一律输出【SKIP】。".to_string(),
+        "如果决定跳过，必须只输出“【SKIP】”，不要带解释、不要带标点、不要输出 [SKIP]、skip 或别的变体。".to_string(),
+        "默认不用 Markdown：不要标题、列表、引用、代码块、加粗、反引号。除非用户明确要代码、命令或结构化内容，否则用普通纯文本短句回复。".to_string(),
+        "你可以参考最近上下文和本群记忆决定是否接话，但不能因为看懂了上下文就硬插话。".to_string(),
         format!("本群长期记忆：{}", if long_memory.is_empty() { "暂无" } else { &long_memory }),
     ];
+    if missed_backlog > 0 {
+        prompt_parts.push(format!(
+            "刚才有 {missed_backlog} 条消息因排队未被立即处理。它们只是补充上下文，不代表你必须补说；只有在现在开口确实更合适时才回复。"
+        ));
+    }
     let tool_prompt = build_tool_system_prompt(config);
     if !tool_prompt.trim().is_empty() {
         prompt_parts.push(tool_prompt);
@@ -411,8 +532,8 @@ async fn build_reply_messages(
             role: "user".to_string(),
             content: format!(
                 "最近共享上下文：\n{}\n\n本次最新消息：\n{}",
-                build_timeline(state, group_id, 20).await,
-                current_text
+                rendered_timeline.text,
+                format_timeline_line(current_display_id, current_reply_display_id, current_sender, current_text),
             ),
         },
     ])
@@ -438,7 +559,7 @@ async fn generate_reply_with_tools(
                 )
                 .await?
         };
-        let normalized = reply_text.trim().to_string();
+        let normalized = normalize_model_reply(&reply_text);
         if normalized.is_empty() || normalized == SKIP_TEXT {
             return Ok(normalized);
         }
@@ -602,16 +723,143 @@ async fn should_attempt_group_memory_update(
 }
 
 async fn build_timeline(state: &Arc<AppState>, group_id: &str, limit: usize) -> String {
+    render_timeline(state, group_id, limit).await.text
+}
+
+#[derive(Debug, Clone)]
+struct RenderedTimeline {
+    text: String,
+    message_id_to_display_id: HashMap<String, String>,
+}
+
+async fn render_timeline(state: &Arc<AppState>, group_id: &str, limit: usize) -> RenderedTimeline {
     let entries = get_history_entries(state, group_id, limit).await;
     if entries.is_empty() {
-        return "(暂无上下文)".to_string();
+        return RenderedTimeline {
+            text: "(暂无上下文)".to_string(),
+            message_id_to_display_id: HashMap::new(),
+        };
     }
-    entries
+
+    let prefix = get_or_assign_timeline_group_prefix(state, group_id).await;
+    let mut message_id_to_display_id = HashMap::new();
+    for (index, item) in entries.iter().enumerate() {
+        let display_id = format!("{prefix}-{}", index + 1);
+        if let Some(message_id) = item.message_id.as_ref().filter(|value| !value.trim().is_empty()) {
+            message_id_to_display_id.insert(message_id.clone(), display_id);
+        }
+    }
+
+    let lines = entries
         .iter()
         .enumerate()
-        .map(|(index, item)| format!("{}. [{}] {}: {}", index + 1, item.time, item.sender, item.text))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(|(index, item)| {
+            let display_id = format!("{prefix}-{}", index + 1);
+            let reply_display_id = item
+                .reply_to_message_id
+                .as_ref()
+                .and_then(|id| message_id_to_display_id.get(id))
+                .map(String::as_str);
+            format_timeline_line(Some(display_id.as_str()), reply_display_id, &item.sender, &item.text)
+        })
+        .collect::<Vec<_>>();
+
+    RenderedTimeline {
+        text: lines.join("\n"),
+        message_id_to_display_id,
+    }
+}
+
+async fn get_or_assign_timeline_group_prefix(state: &Arc<AppState>, group_id: &str) -> String {
+    let mut memory = state.memory.lock().await;
+    let prefixes = &mut memory.global.timeline_group_prefixes;
+
+    let mut used = HashSet::new();
+    for (gid, value) in prefixes.iter() {
+        if gid == group_id {
+            continue;
+        }
+        if let Some(prefix) = normalize_group_prefix(value) {
+            used.insert(prefix);
+        }
+    }
+
+    let existing_raw = prefixes.get(group_id).cloned().unwrap_or_default();
+    if let Some(existing) = normalize_group_prefix(&existing_raw) {
+        if !used.contains(&existing) {
+            if existing_raw != existing {
+                prefixes.insert(group_id.to_string(), existing.clone());
+                let _ = util::write_json_pretty(&state.memory_path, &*memory);
+            }
+            return existing;
+        }
+    }
+
+    let candidate = (1u16..=999u16)
+        .map(|value| format!("{value:03}"))
+        .find(|value| !used.contains(value))
+        .unwrap_or_else(|| "000".to_string());
+    prefixes.insert(group_id.to_string(), candidate.clone());
+    let _ = util::write_json_pretty(&state.memory_path, &*memory);
+    candidate
+}
+
+fn normalize_group_prefix(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() == 3 && trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some(trimmed.to_string());
+    }
+    if let Ok(number) = trimmed.parse::<u16>() {
+        if (1..=999).contains(&number) {
+            return Some(format!("{number:03}"));
+        }
+    }
+    None
+}
+
+fn format_timeline_line(
+    display_id: Option<&str>,
+    reply_display_id: Option<&str>,
+    sender: &str,
+    text: &str,
+) -> String {
+    let sender = sender.trim();
+    let text = text.trim().replace('\r', " ").replace('\n', " ");
+    let Some(display_id) = display_id.filter(|value| !value.trim().is_empty()) else {
+        return format!("{sender}:{text}");
+    };
+    let mut header = format!("[id:{display_id}");
+    if let Some(reply_display_id) = reply_display_id.filter(|value| !value.trim().is_empty()) {
+        header.push_str(&format!(",reply:{reply_display_id}"));
+    }
+    header.push(']');
+    format!("{header}{sender}:{text}")
+}
+
+fn normalize_model_reply(reply_text: &str) -> String {
+    let normalized = reply_text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace("[SKIP]", SKIP_TEXT)
+        .replace("[skip]", SKIP_TEXT)
+        .trim()
+        .to_string();
+    if normalized.is_empty() {
+        return normalized;
+    }
+    let skip_like = normalized
+        .trim_end_matches(['。', '.', '!', '！', '?', '？', '…', ' '])
+        .trim();
+    if skip_like.eq_ignore_ascii_case("skip")
+        || skip_like.eq_ignore_ascii_case("[skip]")
+        || skip_like == SKIP_TEXT
+    {
+        return SKIP_TEXT.to_string();
+    }
+    normalized
 }
 
 async fn get_history_entries(state: &Arc<AppState>, group_id: &str, limit: usize) -> Vec<HistoryEntry> {
@@ -623,6 +871,23 @@ async fn get_history_entries(state: &Arc<AppState>, group_id: &str, limit: usize
         .into_iter()
         .rev()
         .collect()
+}
+
+async fn record_missed_backlog(state: &Arc<AppState>, group_id: &str) -> usize {
+    let mut backlog = state.missed_backlog.lock().await;
+    let entry = backlog.entry(group_id.to_string()).or_insert(0);
+    *entry = entry.saturating_add(1).min(32);
+    *entry
+}
+
+async fn peek_missed_backlog(state: &Arc<AppState>, group_id: &str) -> usize {
+    let backlog = state.missed_backlog.lock().await;
+    backlog.get(group_id).copied().unwrap_or(0)
+}
+
+async fn take_missed_backlog(state: &Arc<AppState>, group_id: &str) -> usize {
+    let mut backlog = state.missed_backlog.lock().await;
+    backlog.remove(group_id).unwrap_or(0)
 }
 
 async fn get_group_lock(state: &Arc<AppState>, group_id: &str) -> Arc<GroupGate> {
@@ -735,9 +1000,23 @@ fn should_ignore(config: &Config, message_text: &str) -> bool {
     trimmed.is_empty() || config.bot.ignore_prefixes.iter().any(|prefix| trimmed.starts_with(prefix))
 }
 
-fn should_reply_by_rule(config: &Config, message_text: &str, self_id: &str) -> bool {
+fn should_reply_by_rule(
+    config: &Config,
+    group_id: &str,
+    message_text: &str,
+    self_id: &str,
+    missed_backlog: usize,
+) -> ReplyRuleDecision {
+    let group_bonus = group_reply_probability_bonus(config, group_id);
     if config.bot.mention_reply && !self_id.is_empty() && message_text.contains(&format!("[OP:at,id={self_id}]")) {
-        return true;
+        return ReplyRuleDecision {
+            should_reply: true,
+            reason: "mention".to_string(),
+            probability: 1.0,
+            roll: None,
+            backlog_bonus: 0.0,
+            group_bonus,
+        };
     }
     if config
         .bot
@@ -745,10 +1024,69 @@ fn should_reply_by_rule(config: &Config, message_text: &str, self_id: &str) -> b
         .iter()
         .any(|keyword| !keyword.trim().is_empty() && message_text.contains(keyword))
     {
-        return true;
+        return ReplyRuleDecision {
+            should_reply: true,
+            reason: "reply-keyword".to_string(),
+            probability: 1.0,
+            roll: None,
+            backlog_bonus: 0.0,
+            group_bonus,
+        };
     }
-    let probability = config.bot.reply_probability.clamp(0.0, 1.0);
-    rand::rng().random_bool(probability)
+    let mut probability = config.bot.reply_probability.clamp(0.0, 1.0);
+    if group_bonus != 0.0 {
+        probability = (probability + group_bonus).clamp(0.0, 1.0);
+    }
+    let mut backlog_bonus = 0.0;
+    if missed_backlog > 0 {
+        backlog_bonus = 0.08 * missed_backlog.min(3) as f64;
+        probability = (probability + backlog_bonus).min(0.35_f64.max(probability));
+    }
+    let roll = rand::rng().random::<f64>();
+    ReplyRuleDecision {
+        should_reply: roll < probability,
+        reason: if roll < probability {
+            "probability-hit".to_string()
+        } else {
+            "probability-roll-miss".to_string()
+        },
+        probability,
+        roll: Some(roll),
+        backlog_bonus,
+        group_bonus,
+    }
+}
+
+fn group_reply_probability_bonus(config: &Config, group_id: &str) -> f64 {
+    let normalized_group_id = group_id.trim();
+    config
+        .bot
+        .reply_probability_bonus_by_group
+        .iter()
+        .find_map(|(configured_group_id, bonus)| {
+            if configured_group_id.trim() == normalized_group_id {
+                Some((*bonus).clamp(-1.0, 1.0))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0.0)
+}
+
+fn format_roll(roll: Option<f64>) -> String {
+    roll.map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn classify_model_skip_reason(reply_text: &str) -> Option<&'static str> {
+    let trimmed = reply_text.trim();
+    if trimmed.is_empty() {
+        Some("empty-reply")
+    } else if trimmed == SKIP_TEXT {
+        Some("model-returned-skip")
+    } else {
+        None
+    }
 }
 
 fn sample_reply_delay(config: &Config) -> f64 {
@@ -886,6 +1224,29 @@ fn extract_message_image_urls(message: Option<&Value>) -> Vec<String> {
         }
     }
     urls
+}
+
+fn extract_reply_to_message_id(message: Option<&Value>) -> Option<String> {
+    let Some(items) = message.and_then(Value::as_array) else {
+        return None;
+    };
+    for segment in items {
+        let seg_type = segment.get("type").and_then(Value::as_str).unwrap_or_default();
+        if seg_type != "reply" {
+            continue;
+        }
+        let data = segment.get("data").and_then(Value::as_object);
+        let Some(data) = data else {
+            continue;
+        };
+        if let Some(value) = data.get("id").or_else(|| data.get("message_id")).or_else(|| data.get("messageId")) {
+            let id = value_to_string(value);
+            if !id.trim().is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 fn looks_like_persistent_memory(text: &str) -> bool {

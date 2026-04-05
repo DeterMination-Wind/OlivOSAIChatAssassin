@@ -18,8 +18,8 @@ NapCatAIChatAssassin 的 Rust 运行时仓库。项目已从旧的 OlivOS 插件
 ## 获取源码
 
 ```bash
-git clone https://github.com/DeterMination-Wind/NapCatAIChatAssassin-Rust.git
-cd NapCatAIChatAssassin-Rust
+git clone https://github.com/DeterMination-Wind/OlivOSAIChatAssassin.git
+cd OlivOSAIChatAssassin
 ```
 
 ## 环境要求
